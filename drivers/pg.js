@@ -102,7 +102,7 @@ async function runWithRetry(connection, sql, values, logSql) {
                         () => { try { reserved.release(); } catch (_) {} });
                 } catch (acqErr) {
                     const acqCode = errCode(acqErr);
-                    // ping still in-flight on VALIDATE_TIMEOUT — the late-settle hook releases it
+                    // on VALIDATE_TIMEOUT the ping is still in flight; the late-settle hook releases it
                     if (reserved && acqCode !== 'VALIDATE_TIMEOUT') {
                         try { reserved.release(); } catch (releaseErr) { logger.trace(`Failed to release stale connection :: ${releaseErr}`); }
                     }
@@ -158,6 +158,46 @@ async function runWithRetry(connection, sql, values, logSql) {
 }
 
 
+const PG_URI = /^(postgres(?:ql)?:\/\/)(?:(.*)@)?([^/?]*)(\/[^?]*)?(\?.*)?$/i;
+const RESERVED = /[@\/?#\s"<>\\^`{|}\[\]]/;
+const VALID_ESCAPES = /^(?:[^%]|%[0-9A-Fa-f]{2})*$/;
+
+function encodeComponent(value) {
+    const alreadyEncoded = value.includes('%') && VALID_ESCAPES.test(value) && !RESERVED.test(value);
+    return alreadyEncoded ? value : encodeURIComponent(value);
+}
+
+function normalizeConnectionString(connectionString) {
+    const m = typeof connectionString === 'string' && connectionString.match(PG_URI);
+    if (!m) return connectionString;
+    const [, scheme, userinfo, hosts, database = '', query = ''] = m;
+    let credentials = '';
+    if (userinfo !== undefined) {
+        const colon = userinfo.indexOf(':');
+        credentials = colon < 0
+            ? encodeComponent(userinfo)
+            : encodeComponent(userinfo.slice(0, colon)) + ':' + encodeComponent(userinfo.slice(colon + 1));
+        credentials += '@';
+    }
+    return scheme + credentials + hosts + (database && '/' + encodeComponent(database.slice(1))) + query;
+}
+
+// one postgres.js pool per target for CRUDs with sharedPool: true or PG_SHARED_POOL=true; closed by the last user
+const sharedPools = new Map(); // key -> { connection, users }
+
+function sharedPoolKey(cd, baseOptions) {
+    const target = cd.connectionString
+        ? normalizeConnectionString(cd.connectionString)
+        : `${cd.host}:${cd.port}/${cd.database}@${cd.user}`;
+    const { max, prepare, idle_timeout, max_lifetime, connect_timeout, connection } = baseOptions;
+    return JSON.stringify([target, !!cd.ssl, cd.parseDates, max, prepare, idle_timeout, max_lifetime, connect_timeout, connection]);
+}
+
+function sharedPoolUsers(key) {
+    const pool = sharedPools.get(key);
+    return pool ? pool.users : 0;
+}
+
 /**
  * @param {object} options CRUD options
  */
@@ -184,23 +224,25 @@ CRUD.prototype.connect = async function () {
 
         const optNum = (v) => { const n = parseInt(v, 10); return Number.isNaN(n) ? undefined : n; };
 
-        const statementTimeout = String(process.env.PG_STATEMENT_TIMEOUT || '').trim();
+        const statementTimeout = String(cd.statementTimeout || process.env.PG_STATEMENT_TIMEOUT || '').trim();
         const useStatementTimeout = /^\d+\s*(ms|s|min|h|d)?$/i.test(statementTimeout) && parseInt(statementTimeout, 10) > 0;
 
         let baseOptions = {
             ssl: cd.ssl,
             max: parseInt(cd.maxPool, 10) || 10,
+            prepare: String(cd.prepare) === 'false' ? false : undefined,
             idle_timeout: optNum(cd.idleTimeout),
             max_lifetime: optNum(cd.maxLifetime),
             connect_timeout: optNum(cd.connectTimeout),
             connection: Object.assign(
                 { application_name: cd.applicationName || process.env.HOSTNAME || 'rest-crud' },
-                useStatementTimeout ? { statement_timeout: statementTimeout } : {}
+                useStatementTimeout ? { statement_timeout: statementTimeout } : {},
+                cd.searchPath ? { search_path: cd.searchPath } : {}
             ),
-            // cap postgres.js reconnect backoff (default grows to 20s) so a dead DB surfaces fast
+            // postgres.js default reconnect backoff grows to 20s; cap it at 2s
             backoff: (retries) => Math.min(0.1 * (2 ** retries), 2) * (0.5 + Math.random() / 2),
             onnotice: (notice) => logger.trace(`PG Notice :: ${notice && notice.message}`),
-            types: {
+            types: cd.parseDates === 'native' ? undefined : {
                 date: {
                     from: [1082],
                     parse: v => v
@@ -218,29 +260,38 @@ CRUD.prototype.connect = async function () {
         baseOptions = Object.fromEntries(
             Object.entries(baseOptions).filter(([_, v]) => v !== null && v !== undefined)
         );
-        // Create postgres client
-        this.connection = cd.connectionString
-            ? postgres(cd.connectionString,
-                {
+        const shareable = String(cd.sharedPool !== undefined ? cd.sharedPool : process.env.PG_SHARED_POOL || 'false').trim().toLowerCase() === 'true';
+        this.sharedPoolKey = shareable ? sharedPoolKey(cd, baseOptions) : null;
+        const shared = this.sharedPoolKey ? sharedPools.get(this.sharedPoolKey) : null;
+        if (shared) {
+            shared.users++;
+            this.connection = shared.connection;
+            logger.info(`Joined shared PostgreSQL pool :: ${shared.users} users`);
+        } else {
+            this.connection = cd.connectionString
+                ? postgres(normalizeConnectionString(cd.connectionString),
+                    {
+                        ...baseOptions
+                    })
+                : postgres({
+                    host: cd.host,
+                    port: cd.port,
+                    username: cd.user,
+                    password: cd.password,
+                    database: cd.database,
                     ...baseOptions
-                })
-            : postgres({
-                host: cd.host,
-                port: cd.port,
-                username: cd.user,
-                password: cd.password,
-                database: cd.database,
-                ...baseOptions
-            });
+                });
+            if (this.sharedPoolKey) sharedPools.set(this.sharedPoolKey, { connection: this.connection, users: 1 });
+        }
 
-        // Test connection
-        await this.connection`SELECT 1 + 1 AS solution`;
+        if (!cd.lazyConnect) await this.connection`SELECT 1 + 1 AS solution`;
 
         const preValidate = String(process.env.PG_PRE_VALIDATE || 'true').trim().toLowerCase() !== 'false';
         const bypassWindowMs = Math.max(0, resolveNumber(process.env.PG_PRE_VALIDATE_INTERVAL, 3000));
-        logger.info(`Connected to PostgreSQL :: pool max=${baseOptions.max}, application_name=${baseOptions.connection.application_name}`
-            + ` | statement_timeout=${useStatementTimeout ? statementTimeout + ' (PG_STATEMENT_TIMEOUT)' : 'DISABLED — a runaway query is never cancelled server-side'}`);
-        logger.info(`Pre-validation ${preValidate ? 'ENABLED' : 'DISABLED'} (PG_PRE_VALIDATE)`
+        const connected = cd.lazyConnect ? 'PostgreSQL client ready, connects on first statement' : 'Connected to PostgreSQL';
+        logger[cd.lazyConnect ? 'debug' : 'info'](`${connected} :: pool max=${baseOptions.max}${this.sharedPoolKey ? ` shared by ${sharedPoolUsers(this.sharedPoolKey)}` : ''}, application_name=${baseOptions.connection.application_name}`
+            + ` | statement_timeout=${useStatementTimeout ? statementTimeout : 'disabled'}`);
+        logger.debug(`Pre-validation ${preValidate ? 'ENABLED' : 'DISABLED'} (PG_PRE_VALIDATE)`
             + ` | bypass window=${bypassWindowMs}ms (PG_PRE_VALIDATE_INTERVAL${bypassWindowMs === 0 ? ' — every query validated' : ''})`
             + ` | request deadline=${DATASERVICE_TIMEOUT_MS}ms (DATASERVICE_TIMEOUT)`
             + ` | acquire budget=${Math.max(1000, resolveNumber(process.env.PG_ACQUIRE_TIMEOUT, ACQUIRE_TIMEOUT_DEFAULT_MS))}ms (PG_ACQUIRE_TIMEOUT)`
@@ -260,6 +311,15 @@ CRUD.prototype.connect = async function () {
  */
 CRUD.prototype.disconnect = async function () {
     try {
+        const shared = this.sharedPoolKey ? sharedPools.get(this.sharedPoolKey) : null;
+        if (shared && shared.connection === this.connection) {
+            shared.users--;
+            if (shared.users > 0) {
+                logger.info(`Left shared PostgreSQL pool :: ${shared.users} users remain`);
+                return 'Database Disconnected';
+            }
+            sharedPools.delete(this.sharedPoolKey);
+        }
         await this.connection.end({ timeout: 5 });
         logger.info('Database disconnected');
         return 'Database Disconnected';
@@ -276,15 +336,14 @@ CRUD.prototype.disconnect = async function () {
 CRUD.prototype.sqlQuery = async function (sql, values) {
     if (!sql) throw new Error('No sql query provided.');
 
-    const result = await runWithRetry(this.connection, sql, values, true);
+    const result = await runWithRetry(this.connection, sql, Array.isArray(values) ? values : undefined, true);
     logger.trace(`Query result :: ${JSON.stringify(result[0])}`);
     return result;
 };
 
 
 /**
- * Runs fn inside a transaction on a single reserved connection. Connection-class
- * errors retry the whole block, so fn must be safe to re-run.
+ * Runs fn in a transaction. Connection errors retry the whole block; fn must be safe to re-run.
  */
 CRUD.prototype.withTransaction = async function (fn) {
     const maxRetries = Math.max(0, resolveNumber(process.env.PG_QUERY_RETRIES, 3));
@@ -485,7 +544,7 @@ Table.prototype.update = async function (id, data) {
         logger.trace(`SQL :: ${sql}`);
 
         const result = await runWithRetry(this.connection, sql);
-        return result.length;   // number of affected rows
+        return result.length;
 
     } catch (err) {
         logger.error(`Error updating :: ${err}`);
@@ -539,3 +598,5 @@ Table.prototype.deleteMany = async function (ids) {
 
 
 module.exports = CRUD;
+module.exports.normalizeConnectionString = normalizeConnectionString;
+module.exports.sharedPoolCount = () => sharedPools.size;
